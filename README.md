@@ -10,11 +10,13 @@ source $HOME/.cargo/env
 
 ## Structure du projet
 
+```text
 rust_http/
 ├── src/
 │   └── main.rs      ← Application principale
 ├── Cargo.toml       ← Manifeste du projet
 └── build_wasm.sh    ← Script de compilation
+```
 
 ## Configuration du projet
 
