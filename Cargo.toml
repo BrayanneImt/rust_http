@@ -1,0 +1,16 @@
+[package]
+name = "rust_http"
+version = "0.1.0"
+edition = "2024"
+description = "HTTP TCP Client WASM — port Rust de l'application Zephyr heltec_v3"
+
+[[bin]]
+name = "http_wasm"
+path = "src/main.rs"
+
+[profile.release]
+opt-level = "s"    # optimiser pour la taille (important pour IoT)
+lto = true
+strip = true
+
+[dependencies]
