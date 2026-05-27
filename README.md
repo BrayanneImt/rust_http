@@ -55,3 +55,20 @@ source ~/.bashrc
 # Tester le WASM Rust
 wasmtime http_rust.wasm
 ```
+
+## Déploiement
+
+```bash
+python3 -m venv .venv
+
+# activer l'environnment virtuel
+source .venv/bin/activate
+# sous windows
+source mon_env/bin/activate
+
+# Installer les dependences necessaire
+pip install pyserial
+
+# Execution
+python3 upload.py
+```
