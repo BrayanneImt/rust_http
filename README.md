@@ -1,4 +1,4 @@
-# Projet Rust
+# Projet Rust de l'app zephyr pour la creation de socket et envoie de metrique
 
 ## Préréquis
 
