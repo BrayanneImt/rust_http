@@ -18,10 +18,6 @@
 //!   LOG_ERR() / LOG_WRN()             ↔  eprintln!()
 //!   GPIO blinky                       ↔  host_gpio_blink()
 //!
-//! Compilation :
-//!   rustup target add wasm32-wasip1
-//!   cargo build --target wasm32-wasip1 --release
-//!   cp target/wasm32-wasip1/release/http_wasm.wasm http_rust.wasm
 
 use std::io::{Read, Write};
 use std::net::TcpStream;
