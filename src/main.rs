@@ -1,7 +1,5 @@
 //! http_wasm — HTTP TCP Client + LED Blinky (Rust WASI)
 //!
-//! Port complet de l'application Zephyr main.c vers Rust/WASM.
-//!
 //! Correspondance Zephyr ↔ Rust/WASI :
 //!   WIFI_SSID / WIFI_PSK              ↔  WIFI_SSID / WIFI_PSK (const)
 //!   net_mgmt(WIFI_CONNECT)            ↔  host_wifi_connect(ssid, psk)
@@ -10,14 +8,13 @@
 //!   zsock_socket() + connect()        ↔  TcpStream::connect()
 //!   zsock_setsockopt(SO_RCVTIMEO)     ↔  stream.set_read_timeout()
 //!   zsock_setsockopt(SO_SNDTIMEO)     ↔  stream.set_write_timeout()
-//!   zsock_send()                      ↔  stream.write_all()
+//!   zsock_send()                      ↔  stream.write_all() + flush()
 //!   zsock_recv()                      ↔  stream.read()
 //!   zsock_close()                     ↔  drop(stream)
 //!   k_sleep(K_SECONDS(3))             ↔  thread::sleep(Duration::from_secs(3))
 //!   LOG_INF()                         ↔  println!()
 //!   LOG_ERR() / LOG_WRN()             ↔  eprintln!()
 //!   GPIO blinky                       ↔  host_gpio_blink()
-//!
 
 use std::io::{Read, Write};
 use std::net::TcpStream;
@@ -25,13 +22,13 @@ use std::thread;
 use std::time::Duration;
 
 // ==================================================================
-// PARAMETRES RESEAU — identiques à main.c Zephyr
+// PARAMÈTRES RÉSEAU
 // ==================================================================
 const WIFI_SSID: &str = "a26nguep-hotspot";
 const WIFI_PSK:  &str = "123456789";
 
 // ==================================================================
-// PARAMETRES SERVEUR — identiques à main.c Zephyr
+// PARAMÈTRES SERVEUR
 // ==================================================================
 const SERVER_IP:   &str = "10.42.0.1";
 const SERVER_PORT: u16  = 8080;
@@ -45,18 +42,18 @@ const SEND_INTERVAL_SECS:   u64 = 3;
 // HOST FUNCTIONS — importées depuis WAMR/Zephyr
 //
 // Ces fonctions sont fournies par le runtime WAMR embarqué dans
-// Zephyr. WAMR les injecte automatiquement lors de l'instantiation
-// du module WASM. Elles permettent au WASM d'accéder aux
-// fonctionnalités Zephyr (Wi-Fi, GPIO) sans accès direct au matériel.
+// Zephyr. WAMR les injecte lors de l'instantiation du module WASM.
+// Elles sont enregistrées dans main.c Zephyr via
+// wasm_runtime_register_natives("env", native_symbols, ...).
 //
 //   host_wifi_connect()       ↔  net_mgmt(NET_REQUEST_WIFI_CONNECT)
-//   host_wait_network_ready() ↔  k_sem_take(&net_ready, K_SECONDS(30))
+//   host_wait_network_ready() ↔  k_sem_take(&net_ready_wamr, ...)
 //   host_gpio_blink()         ↔  gpio_pin_set_dt() + k_msleep(150)
 // ==================================================================
 #[link(wasm_import_module = "env")]
 extern "C" {
-    /// Déclenche la connexion Wi-Fi côté Zephyr avec les credentials fournis.
-    /// Retourne 0 si la demande est acceptée, <0 en cas d'erreur.
+    /// Déclenche la connexion Wi-Fi côté Zephyr.
+    /// Retourne 0 si la demande est acceptée, < 0 en cas d'erreur.
     fn host_wifi_connect(
         ssid_ptr: *const u8, ssid_len: u32,
         psk_ptr:  *const u8, psk_len:  u32,
@@ -66,16 +63,16 @@ extern "C" {
     /// Retourne 0 si le réseau est prêt, -1 si timeout.
     fn host_wait_network_ready(timeout_secs: u32) -> i32;
 
-    /// Fait clignoter la LED GPIO via Zephyr.
+    /// Fait clignoter la LED GPIO via Zephyr (150 ms ON, 150 ms OFF).
     fn host_gpio_blink();
 }
 
 // ==================================================================
 // wifi_connect_init()
 //
-// Equivalent de wifi_connect() dans main.c Zephyr.
-// Envoie les credentials Wi-Fi au runtime Zephyr puis attend
-// l'obtention de l'adresse IP DHCP (timeout 30s).
+// Équivalent de wifi_connect() dans main.c Zephyr.
+// Envoie les credentials Wi-Fi au runtime Zephyr via host functions,
+// puis attend l'attribution de l'IP DHCP (timeout 30 s).
 // ==================================================================
 fn wifi_connect_init() -> Result<(), String> {
     println!("============================================");
@@ -83,8 +80,9 @@ fn wifi_connect_init() -> Result<(), String> {
     println!(" SSID : {}", WIFI_SSID);
     println!("============================================");
 
+    println!("Connexion Wi-Fi -> SSID : \"{}\"", WIFI_SSID);
+
     // ↔ net_mgmt(NET_REQUEST_WIFI_CONNECT, iface, &params, sizeof(params))
-    println!("Connexion Wi-Fi → SSID : \"{}\"", WIFI_SSID);
     let ret = unsafe {
         host_wifi_connect(
             WIFI_SSID.as_ptr(), WIFI_SSID.len() as u32,
@@ -113,32 +111,36 @@ fn wifi_connect_init() -> Result<(), String> {
 // ==================================================================
 // blink_led()
 //
-// Equivalent de blink_led() dans main.c Zephyr.
-// Appelle host_gpio_blink() qui déclenche le clignotement
-// physique de la LED via les GPIO Zephyr.
+// Équivalent de blink_led() dans main.c Zephyr.
+// Appelle host_gpio_blink() qui déclenche le clignotement physique
+// de la LED onboard via les GPIO Zephyr.
 // ==================================================================
 fn blink_led() {
+    // ↔ gpio_pin_set_dt(&led, 1) + k_msleep(150) + gpio_pin_set_dt(&led, 0)
     unsafe { host_gpio_blink() };
 }
 
 // ==================================================================
 // send_http_post()
 //
-// Equivalent de send_http_post() dans main.c Zephyr.
-// Flux TCP identique :
-//   TcpStream::connect()   ↔  zsock_socket() + zsock_connect()
-//   set_read_timeout(5s)   ↔  zsock_setsockopt(SO_RCVTIMEO, 5s)
-//   set_write_timeout(5s)  ↔  zsock_setsockopt(SO_SNDTIMEO, 5s)
-//   stream.write_all()     ↔  zsock_send()
-//   stream.read()          ↔  zsock_recv()
-//   drop(stream)           ↔  zsock_close()
+// Équivalent de send_http_post() dans main.c Zephyr.
+//
+// Flux TCP identique à l'application native :
+//   TcpStream::connect()        ↔  zsock_socket() + zsock_connect()
+//   set_read_timeout(5s)        ↔  zsock_setsockopt(SO_RCVTIMEO, 5s)
+//   set_write_timeout(5s)       ↔  zsock_setsockopt(SO_SNDTIMEO, 5s)
+//   stream.write_all() + flush()↔  zsock_send()
+//   stream.read()               ↔  zsock_recv()
+//   drop(stream)                ↔  zsock_close()
 // ==================================================================
 fn send_http_post(seq: u32) -> Result<(), Box<dyn std::error::Error>> {
     let addr = format!("{}:{}", SERVER_IP, SERVER_PORT);
 
     // ↔ zsock_socket() + zsock_connect()
-    println!("[{}] Connexion TCP → {} ...", seq, addr);
-    let mut stream = TcpStream::connect(&addr)?;
+    println!("[{}] Connexion TCP -> {} ...", seq, addr);
+    let mut stream = TcpStream::connect(&addr).map_err(|e| {
+        format!("zsock_connect failed : {}", e)
+    })?;
     println!("[{}] Connexion TCP etablie", seq);
 
     // ↔ zsock_setsockopt SO_RCVTIMEO / SO_SNDTIMEO
@@ -167,8 +169,10 @@ fn send_http_post(seq: u32) -> Result<(), Box<dyn std::error::Error>> {
     );
 
     // ↔ zsock_send()
+    // flush() explicite pour garantir l'envoi complet avant le recv
     println!("[{}] Envoi HTTP POST ({} octets)...", seq, request.len());
     stream.write_all(request.as_bytes())?;
+    stream.flush()?;
     println!("[{}] {} octets envoyes", seq, request.len());
 
     // ↔ zsock_recv()
@@ -184,7 +188,8 @@ fn send_http_post(seq: u32) -> Result<(), Box<dyn std::error::Error>> {
 
     // ↔ strstr(rx_buf, "\r\n\r\n")
     if let Some(pos) = response.find("\r\n\r\n") {
-        println!("[{}] *** ACK SERVEUR : {} ***", seq, response[pos + 4..].trim());
+        println!("[{}] *** ACK SERVEUR : {} ***",
+                 seq, response[pos + 4..].trim());
     } else {
         println!("[{}] Reponse brute : {}", seq, response.trim());
     }
@@ -197,15 +202,15 @@ fn send_http_post(seq: u32) -> Result<(), Box<dyn std::error::Error>> {
 // ==================================================================
 // main()
 //
-// Equivalent de main() dans main.c Zephyr.
-// Sequence identique :
-//   1. Banniere
+// Équivalent de main() dans main.c Zephyr.
+// Séquence identique :
+//   1. Bannière
 //   2. Connexion Wi-Fi + DHCP
 //   3. Boucle infinie : blink → POST → sleep(3s)
 // ==================================================================
 fn main() {
     println!("============================================");
-    println!(" WASM HTTP TCP Client + Blinky  [Rust v1]");
+    println!(" WASM HTTP TCP Client + Blinky  [Rust v2]");
     println!(" SSID    : {}", WIFI_SSID);
     println!(" Serveur : {}:{}", SERVER_IP, SERVER_PORT);
     println!("============================================");
@@ -232,7 +237,10 @@ fn main() {
         // ↔ ret = send_http_post(seq);
         if let Err(e) = send_http_post(seq) {
             // ↔ LOG_WRN("Envoi [%d] echoue, retry dans 3s", seq, ret)
-            eprintln!("Envoi [{}] echoue ({:?}), retry dans {}s", seq, e, SEND_INTERVAL_SECS);
+            eprintln!(
+                "Envoi [{}] echoue ({:?}), retry dans {}s",
+                seq, e, SEND_INTERVAL_SECS
+            );
         }
 
         // ↔ k_sleep(K_SECONDS(3))

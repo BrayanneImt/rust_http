@@ -3,9 +3,16 @@
 ## Préréquis
 
 ```bash
-#Installer Rust (si absent)
+# Installer Rust (si absent)
 curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
 source $HOME/.cargo/env
+
+# Ajouter la cible WebAssembly WASI
+rustup target add wasm32-wasip1
+
+# Vérifier
+rustup target list --installed | grep wasm
+# → wasm32-wasip1
 ```
 
 ## Structure du projet
@@ -13,23 +20,28 @@ source $HOME/.cargo/env
 ```text
 rust_http/
 ├── src/
-│   └── main.rs      ← Application principale
-├── Cargo.toml       ← Manifeste du projet
-└── build_wasm.sh    ← Script de compilation
+│   └── main.rs       ← Application principale (HTTP TCP + LED blinky)
+├── Cargo.toml        ← Manifeste du projet
+├── build_wasm.sh     ← Script de compilation Rust → WASM
+└── upload.py         ← Script d'envoi UART vers l'équipement IoT
 ```
 
 ## Configuration du projet
 
 ```bash
 #cloner le repo
-git clone lien_du_repo
+git clone https://github.com/BrayanneImt/rust_http.git
+```
 
-# Ajouter la cible WebAssembly WASI
-rustup target add wasm32-wasip1
+## Paramètres à adapter avant compilation
 
-# Vérifier
-rustup target list --installed | grep wasm
-# → wasm32-wasip1 resultat
+Dans `src/main.rs`, modifier si nécessaire :
+
+```c
+const WIFI_SSID: &str = "wifi_name";   // Nom du hotspot
+const WIFI_PSK:  &str = "password";            // Mot de passe
+const SERVER_IP: &str = "IP_server";        // IP du PC sur le hotspot
+const SERVER_PORT: u16 = 8080;
 ```
 
 ## execution du projet pour la generation du fichier wasm
@@ -56,7 +68,7 @@ source ~/.bashrc
 wasmtime http_rust.wasm
 ```
 
-## Déploiement
+## Déploiement sur l'équipement IoT
 
 ```bash
 python3 -m venv .venv
@@ -71,4 +83,6 @@ pip install pyserial
 
 # Execution
 python3 upload.py
+# → Progression de l'upload affichée
+# → UPLOAD DONE
 ```

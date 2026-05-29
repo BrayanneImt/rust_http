@@ -1,42 +1,47 @@
-#!/bin/bash
-# =============================================================
-# build_wasm.sh — Compilation Rust → WebAssembly (WASI)
-# Projet : http_client_wasm
-# Cible  : wasm32-wasi (compatible WAMR embarqué dans Zephyr)
-#
-# Prérequis :
-#   curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
-#   rustup target add wasm32-wasi
-#
-# Usage : bash build_wasm.sh
-# =============================================================
 set -e
 
-echo "=== Build : Rust → WASM (wasm32-wasi) ==="
+echo "=== Build : Rust -> WASM (wasm32-unknown-unknown) ==="
 
-# Vérification rustup + cible
 if ! command -v rustup &>/dev/null; then
-    echo "ERREUR: rustup requis. Installer depuis https://rustup.rs"
+    echo "ERREUR: rustup requis."
     exit 1
 fi
 
-if ! rustup target list --installed | grep -q "wasm32-wasip1"; then
-    echo "[setup] Ajout cible wasm32-wasip1..."
-    rustup target add wasm32-wasip1
+# Supprimer rust-toolchain.toml s'il existe
+if [ -f rust-toolchain.toml ]; then
+    rm rust-toolchain.toml
+    echo "[info] rust-toolchain.toml supprimé"
 fi
 
-# Compilation release (optimisé taille pour IoT)
-cargo build --target wasm32-wasip1 --release
+# Ajouter la cible wasm32-unknown-unknown si absente
+if ! rustup target list --installed | grep -q "wasm32-unknown-unknown"; then
+    echo "[setup] Ajout cible wasm32-unknown-unknown..."
+    rustup target add wasm32-unknown-unknown
+fi
 
-OUTPUT=target/wasm32-wasip1/release/http_wasm.wasm
+echo "[build] cargo build --release --target wasm32-unknown-unknown..."
+cargo build --target wasm32-unknown-unknown --release
+
+OUTPUT=target/wasm32-unknown-unknown/release/http_wasm.wasm
 DEST=http_rust.wasm
-cp "$OUTPUT" "$DEST"
 
+SIZE_BEFORE=$(stat -c%s "$OUTPUT")
+echo "[build] Module brut : ${SIZE_BEFORE} octets ($(( SIZE_BEFORE / 1024 )) KB)"
+
+echo "[opt] wasm-opt -Oz..."
+wasm-opt -Oz --enable-bulk-memory --memory-packing "$OUTPUT" -o "$DEST"
+
+SIZE_AFTER=$(stat -c%s "$DEST")
+GAIN=$(( (SIZE_BEFORE - SIZE_AFTER) * 100 / SIZE_BEFORE ))
+echo "[opt] ${SIZE_BEFORE} → ${SIZE_AFTER} octets (-${GAIN}%)"
 echo ""
-echo "[OK] $DEST — $(ls -lh $DEST | awk '{print $5}')"
-file "$DEST"
+echo "[OK] $DEST — ${SIZE_AFTER} octets ($(( SIZE_AFTER / 1024 )) KB)"
+
+MAX=$(( 96 * 1024 ))
+if [ "$SIZE_AFTER" -gt "$MAX" ]; then
+    echo "ERREUR : module trop grand (${SIZE_AFTER} > ${MAX})"
+    exit 1
+fi
+echo "Taille OK pour l'équipement IoT"
 echo ""
-echo "Test PC :"
-echo "  wasmtime $DEST"
-echo ""
-echo "Déploiement IoT (WAMR dans Zephyr) : voir README.md"
+echo "Déploiement : python3 upload.py"
