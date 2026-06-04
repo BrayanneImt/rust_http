@@ -1,10 +1,3 @@
-#!/bin/bash
-# =============================================================
-# build_wasm.sh — Compilation Rust → WebAssembly
-# Cible : wasm32-unknown-unknown (no_std)
-# wasm-opt 116 : ne supporte pas --no-dce ni --export
-# → on utilise uniquement cargo build --release (opt-level="s" + lto=true)
-# =============================================================
 set -e
 
 echo "=== Build : rust_http -> WASM (wasm32-unknown-unknown) ==="
@@ -20,14 +13,28 @@ cargo build --target wasm32-unknown-unknown --release
 OUTPUT=target/wasm32-unknown-unknown/release/http_wasm.wasm
 DEST=http_rust.wasm
 
-cp "$OUTPUT" "$DEST"
-SIZE=$(stat -c%s "$DEST")
-echo "[OK] $DEST — ${SIZE} octets ($(( SIZE / 1024 )) KB)"
+SIZE_BEFORE=$(stat -c%s "$OUTPUT")
+echo "[build] Module brut : ${SIZE_BEFORE} octets ($(( SIZE_BEFORE / 1024 )) KB)"
 
-MAX=$(( 32 * 1024 ))
-if [ "$SIZE" -gt "$MAX" ]; then
-    echo "ATTENTION : module > ${MAX} octets (WASM_MAX_SIZE = 32KB)"
-    echo "Augmenter WASM_MAX_SIZE dans zephyr_wamr_runtime/src/main.c"
+# wasm-opt -Oz : optimise la taille ET supprime les reference-types
+# (pas de --no-dce ni --export qui ne sont pas supportés par wasm-opt 116)
+if command -v wasm-opt &>/dev/null; then
+    echo "[opt] wasm-opt -Oz --enable-bulk-memory..."
+    wasm-opt -Oz --enable-bulk-memory "$OUTPUT" -o "$DEST"
+    SIZE_AFTER=$(stat -c%s "$DEST")
+    GAIN=$(( (SIZE_BEFORE - SIZE_AFTER) * 100 / SIZE_BEFORE ))
+    echo "[opt] ${SIZE_BEFORE} → ${SIZE_AFTER} octets (-${GAIN}%)"
+else
+    echo "[opt] wasm-opt absent — copie directe"
+    cp "$OUTPUT" "$DEST"
+    SIZE_AFTER=$SIZE_BEFORE
+fi
+
+echo "[OK] $DEST — ${SIZE_AFTER} octets ($(( SIZE_AFTER / 1024 )) KB)"
+
+MAX=$(( 40 * 1024 ))
+if [ "$SIZE_AFTER" -gt "$MAX" ]; then
+    echo "ATTENTION : module > ${MAX} octets (WASM_MAX_SIZE)"
 fi
 
 echo ""

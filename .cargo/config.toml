@@ -1,3 +1,4 @@
+# .cargo/config.toml — rust_http
 #
 # Flags linker wasm-ld pour compatibilité WAMR sur ESP32-S3.
 #
@@ -25,4 +26,5 @@ rustflags = [
     "-C", "link-arg=--max-memory=65536",
     "-C", "link-arg=--initial-memory=65536",
     "-C", "link-arg=--global-base=1024",
+    "-C", "link-arg=--export=_start",
 ]
