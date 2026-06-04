@@ -1,88 +1,195 @@
-//! http_wasm — HTTP TCP Client + LED Blinky (Rust WASI)
+//! http_wasm — HTTP TCP Client + LED Blinky
+//! Cible  : wasm32-unknown-unknown, no_std
 //!
-//! Correspondance Zephyr ↔ Rust/WASI :
-//!   WIFI_SSID / WIFI_PSK              ↔  WIFI_SSID / WIFI_PSK (const)
-//!   net_mgmt(WIFI_CONNECT)            ↔  host_wifi_connect(ssid, psk)
-//!   on_wifi_event / on_dhcp_event     ↔  géré côté WAMR/Zephyr
-//!   k_sem_take(&net_ready, 30s)       ↔  host_wait_network_ready(30)
-//!   zsock_socket() + connect()        ↔  TcpStream::connect()
-//!   zsock_setsockopt(SO_RCVTIMEO)     ↔  stream.set_read_timeout()
-//!   zsock_setsockopt(SO_SNDTIMEO)     ↔  stream.set_write_timeout()
-//!   zsock_send()                      ↔  stream.write_all() + flush()
-//!   zsock_recv()                      ↔  stream.read()
-//!   zsock_close()                     ↔  drop(stream)
-//!   k_sleep(K_SECONDS(3))             ↔  thread::sleep(Duration::from_secs(3))
-//!   LOG_INF()                         ↔  println!()
-//!   LOG_ERR() / LOG_WRN()             ↔  eprintln!()
-//!   GPIO blinky                       ↔  host_gpio_blink()
+//! Reproduit le comportement de l'application Zephyr native :
+//!   1. Connexion Wi-Fi + attente IP DHCP (max 30 s)
+//!   2. Boucle infinie : LED blink → HTTP POST JSON → sleep 3 s
 
-use std::io::{Read, Write};
-use std::net::TcpStream;
-use std::thread;
-use std::time::Duration;
+#![cfg_attr(target_arch = "wasm32", no_std)]
+#![cfg_attr(target_arch = "wasm32", no_main)]
 
-// ==================================================================
-// PARAMÈTRES RÉSEAU
-// ==================================================================
-const WIFI_SSID: &str = "a26nguep-hotspot";
-const WIFI_PSK:  &str = "123456789";
+#[cfg(target_arch = "wasm32")]
+#[panic_handler]
+fn panic(_: &core::panic::PanicInfo) -> ! { loop {} }
 
-// ==================================================================
-// PARAMÈTRES SERVEUR
-// ==================================================================
-const SERVER_IP:   &str = "10.42.0.1";
-const SERVER_PORT: u16  = 8080;
-const DEVICE_NAME: &str = "heltec_v3";
+// ================================================================
+// PARAMÈTRES RÉSEAU — modifier avant compilation
+// ================================================================
+static WIFI_SSID:   &[u8] = b"a26nguep-hotspot";
+static WIFI_PSK:    &[u8] = b"123456789";
+static SERVER_IP:   &[u8] = b"10.42.0.1";
+static DEVICE_NAME: &[u8] = b"heltec_v3";
 
-const NETWORK_TIMEOUT_SECS: u32 = 30;
-const SOCKET_TIMEOUT_SECS:  u64 = 5;
-const SEND_INTERVAL_SECS:   u64 = 3;
+const SERVER_PORT:     u32 = 8080;
+const NETWORK_TIMEOUT: u32 = 30;
+const SOCKET_TIMEOUT:  u32 = 5;
+const SEND_INTERVAL:   u32 = 3;
 
-// ==================================================================
-// HOST FUNCTIONS — importées depuis WAMR/Zephyr
-//
-// Ces fonctions sont fournies par le runtime WAMR embarqué dans
-// Zephyr. WAMR les injecte lors de l'instantiation du module WASM.
-// Elles sont enregistrées dans main.c Zephyr via
-// wasm_runtime_register_natives("env", native_symbols, ...).
-//
-//   host_wifi_connect()       ↔  net_mgmt(NET_REQUEST_WIFI_CONNECT)
-//   host_wait_network_ready() ↔  k_sem_take(&net_ready_wamr, ...)
-//   host_gpio_blink()         ↔  gpio_pin_set_dt() + k_msleep(150)
-// ==================================================================
+// ================================================================
+// HOST FUNCTIONS
+// ================================================================
+#[cfg(target_arch = "wasm32")]
 #[link(wasm_import_module = "env")]
 extern "C" {
-    /// Déclenche la connexion Wi-Fi côté Zephyr.
-    /// Retourne 0 si la demande est acceptée, < 0 en cas d'erreur.
+    fn host_print(msg_ptr: *const u8, msg_len: u32);
     fn host_wifi_connect(
         ssid_ptr: *const u8, ssid_len: u32,
         psk_ptr:  *const u8, psk_len:  u32,
     ) -> i32;
-
-    /// Bloque jusqu'à l'obtention de l'IP DHCP ou expiration du timeout.
-    /// Retourne 0 si le réseau est prêt, -1 si timeout.
     fn host_wait_network_ready(timeout_secs: u32) -> i32;
-
-    /// Fait clignoter la LED GPIO via Zephyr (150 ms ON, 150 ms OFF).
     fn host_gpio_blink();
+    fn host_tcp_connect(
+        ip_ptr: *const u8, ip_len: u32,
+        port: u32, timeout_secs: u32,
+    ) -> i32;
+    fn host_tcp_send(fd: i32, buf_ptr: *const u8, buf_len: u32) -> i32;
+    fn host_tcp_recv(fd: i32, buf_ptr: *mut u8,  buf_len: u32) -> i32;
+    fn host_tcp_close(fd: i32);
+    fn host_sleep(secs: u32);
 }
 
-// ==================================================================
-// wifi_connect_init()
-//
-// Équivalent de wifi_connect() dans main.c Zephyr.
-// Envoie les credentials Wi-Fi au runtime Zephyr via host functions,
-// puis attend l'attribution de l'IP DHCP (timeout 30 s).
-// ==================================================================
-fn wifi_connect_init() -> Result<(), String> {
-    println!("============================================");
-    println!(" Configuration reseau Wi-Fi");
-    println!(" SSID : {}", WIFI_SSID);
-    println!("============================================");
+// ================================================================
+// BUFFERS STATIQUES
+// Utilisation de raw pointers (&raw mut / &raw const) pour éviter
+// les warnings "mutable reference to mutable static" (Rust 2024).
+// ================================================================
+static mut TX_BUF:   [u8; 512] = [0u8; 512];
+static mut RX_BUF:   [u8; 512] = [0u8; 512];
+static mut BODY_BUF: [u8; 128] = [0u8; 128];
+static mut LOG_BUF:  [u8; 128] = [0u8; 128];
 
-    println!("Connexion Wi-Fi -> SSID : \"{}\"", WIFI_SSID);
+// ================================================================
+// MACRO DE LOG — affiche un message via host_print
+// ================================================================
+#[cfg(target_arch = "wasm32")]
+macro_rules! log {
+    ($msg:expr) => {
+        unsafe {
+            host_print($msg.as_ptr(), $msg.len() as u32);
+        }
+    };
+    // Variante avec un suffixe numérique (ex: log_num!("seq=", seq))
+}
 
-    // ↔ net_mgmt(NET_REQUEST_WIFI_CONNECT, iface, &params, sizeof(params))
+// Log avec un entier à la fin : "prefix" + N + "\n"
+#[cfg(target_arch = "wasm32")]
+fn log_num(prefix: &[u8], n: u32) {
+    unsafe {
+        let buf = &raw mut LOG_BUF;
+        let mut i = 0usize;
+        // copier prefix
+        let plen = prefix.len().min(100);
+        (*buf)[..plen].copy_from_slice(&prefix[..plen]);
+        i += plen;
+        // écrire n
+        i = write_u32(&mut *buf, i, n);
+        // newline
+        (*buf)[i] = b'\n'; i += 1;
+        host_print((*buf).as_ptr(), i as u32);
+    }
+}
+
+// ================================================================
+// UTILITAIRES
+// ================================================================
+fn write_bytes(dst: &mut [u8], offset: usize, src: &[u8]) -> usize {
+    let end = offset + src.len();
+    dst[offset..end].copy_from_slice(src);
+    end
+}
+
+fn write_u32(dst: &mut [u8], offset: usize, mut n: u32) -> usize {
+    if n == 0 { dst[offset] = b'0'; return offset + 1; }
+    let mut tmp = [0u8; 10];
+    let mut len = 0usize;
+    while n > 0 { tmp[len] = b'0' + (n % 10) as u8; n /= 10; len += 1; }
+    for i in 0..len { dst[offset + i] = tmp[len - 1 - i]; }
+    offset + len
+}
+
+// ================================================================
+// send_http_post(seq)
+// ================================================================
+#[cfg(target_arch = "wasm32")]
+fn send_http_post(seq: u32) {
+    log_num(b"[HTTP] POST seq=", seq);
+
+    let tx_len = unsafe {
+        // Corps JSON
+        let body = &raw mut BODY_BUF;
+        let mut i = 0;
+        i = write_bytes(&mut *body, i, b"{\"device\":\"");
+        i = write_bytes(&mut *body, i, DEVICE_NAME);
+        i = write_bytes(&mut *body, i, b"\",\"seq\":");
+        i = write_u32(&mut *body, i, seq);
+        i = write_bytes(&mut *body, i, b",\"metric\":\"ping\",\"value\":1}");
+        let body_len = i;
+
+        // Requête HTTP
+        let tx = &raw mut TX_BUF;
+        let mut j = 0;
+        j = write_bytes(&mut *tx, j, b"POST /data HTTP/1.0\r\nHost: ");
+        j = write_bytes(&mut *tx, j, SERVER_IP);
+        j = write_bytes(&mut *tx, j, b":");
+        j = write_u32(&mut *tx, j, SERVER_PORT);
+        j = write_bytes(&mut *tx, j,
+            b"\r\nContent-Type: application/json\r\nContent-Length: ");
+        j = write_u32(&mut *tx, j, body_len as u32);
+        j = write_bytes(&mut *tx, j, b"\r\nConnection: close\r\n\r\n");
+        j = write_bytes(&mut *tx, j, &(*body)[..body_len]);
+        j
+    };
+
+    // Connexion TCP
+    let fd = unsafe {
+        host_tcp_connect(
+            SERVER_IP.as_ptr(), SERVER_IP.len() as u32,
+            SERVER_PORT, SOCKET_TIMEOUT,
+        )
+    };
+    if fd < 0 {
+        log!(b"[HTTP] TCP connect failed\n");
+        return;
+    }
+    log!(b"[HTTP] TCP connected\n");
+
+    // Envoi
+    let sent = unsafe {
+        host_tcp_send(fd, (&raw const TX_BUF) as *const u8, tx_len as u32)
+    };
+
+    if sent > 0 {
+        log!(b"[HTTP] request sent, waiting ACK...\n");
+        // Réception ACK
+        let received = unsafe {
+            host_tcp_recv(
+                fd,
+                (&raw mut RX_BUF) as *mut u8,
+                (core::mem::size_of::<[u8; 512]>() - 1) as u32,
+            )
+        };
+        if received > 0 {
+            log!(b"[HTTP] ACK received\n");
+        }
+    } else {
+        log!(b"[HTTP] send failed\n");
+    }
+
+    unsafe { host_tcp_close(fd); }
+    log!(b"[HTTP] socket closed\n");
+}
+
+// ================================================================
+// POINT D'ENTRÉE WASM
+// ================================================================
+#[cfg(target_arch = "wasm32")]
+#[no_mangle]
+pub extern "C" fn main() {
+    log!(b"============================================\n");
+    log!(b" WASM HTTP TCP Client + Blinky\n");
+    log!(b"============================================\n");
+    log!(b"Connexion Wi-Fi...\n");
+
     let ret = unsafe {
         host_wifi_connect(
             WIFI_SSID.as_ptr(), WIFI_SSID.len() as u32,
@@ -90,160 +197,32 @@ fn wifi_connect_init() -> Result<(), String> {
         )
     };
     if ret != 0 {
-        return Err(format!("Echec WIFI_CONNECT : code {}", ret));
+        log!(b"[ERR] wifi_connect failed\n");
+        return;
     }
 
-    // ↔ k_sem_take(&net_ready, K_SECONDS(30))
-    println!("Attente IP DHCP (max {}s)...", NETWORK_TIMEOUT_SECS);
-    let ret = unsafe { host_wait_network_ready(NETWORK_TIMEOUT_SECS) };
+    log!(b"Attente IP DHCP...\n");
+    let ret = unsafe { host_wait_network_ready(NETWORK_TIMEOUT) };
     if ret != 0 {
-        return Err(format!(
-            "Timeout : pas d'IP DHCP apres {}s. Verifier hotspot \"{}\" actif en 2,4 GHz.",
-            NETWORK_TIMEOUT_SECS, WIFI_SSID
-        ));
+        log!(b"[ERR] DHCP timeout\n");
+        return;
     }
+    log!(b"Reseau pret\n");
 
-    println!("Reseau pret — IP DHCP obtenue");
-    println!("Serveur cible : {}:{}", SERVER_IP, SERVER_PORT);
-    Ok(())
-}
-
-// ==================================================================
-// blink_led()
-//
-// Équivalent de blink_led() dans main.c Zephyr.
-// Appelle host_gpio_blink() qui déclenche le clignotement physique
-// de la LED onboard via les GPIO Zephyr.
-// ==================================================================
-fn blink_led() {
-    // ↔ gpio_pin_set_dt(&led, 1) + k_msleep(150) + gpio_pin_set_dt(&led, 0)
-    unsafe { host_gpio_blink() };
-}
-
-// ==================================================================
-// send_http_post()
-//
-// Équivalent de send_http_post() dans main.c Zephyr.
-//
-// Flux TCP identique à l'application native :
-//   TcpStream::connect()        ↔  zsock_socket() + zsock_connect()
-//   set_read_timeout(5s)        ↔  zsock_setsockopt(SO_RCVTIMEO, 5s)
-//   set_write_timeout(5s)       ↔  zsock_setsockopt(SO_SNDTIMEO, 5s)
-//   stream.write_all() + flush()↔  zsock_send()
-//   stream.read()               ↔  zsock_recv()
-//   drop(stream)                ↔  zsock_close()
-// ==================================================================
-fn send_http_post(seq: u32) -> Result<(), Box<dyn std::error::Error>> {
-    let addr = format!("{}:{}", SERVER_IP, SERVER_PORT);
-
-    // ↔ zsock_socket() + zsock_connect()
-    println!("[{}] Connexion TCP -> {} ...", seq, addr);
-    let mut stream = TcpStream::connect(&addr).map_err(|e| {
-        format!("zsock_connect failed : {}", e)
-    })?;
-    println!("[{}] Connexion TCP etablie", seq);
-
-    // ↔ zsock_setsockopt SO_RCVTIMEO / SO_SNDTIMEO
-    let timeout = Duration::from_secs(SOCKET_TIMEOUT_SECS);
-    stream.set_read_timeout(Some(timeout))?;
-    stream.set_write_timeout(Some(timeout))?;
-
-    // ↔ snprintf(body, ...)
-    let body = format!(
-        "{{\"device\":\"{}\",\"seq\":{},\"metric\":\"ping\",\"value\":1}}",
-        DEVICE_NAME, seq
-    );
-
-    // ↔ snprintf(tx_buf, "POST /data HTTP/1.0\r\n...")
-    let request = format!(
-        "POST /data HTTP/1.0\r\n\
-         Host: {}:{}\r\n\
-         Content-Type: application/json\r\n\
-         Content-Length: {}\r\n\
-         Connection: close\r\n\
-         \r\n\
-         {}",
-        SERVER_IP, SERVER_PORT,
-        body.len(),
-        body
-    );
-
-    // ↔ zsock_send()
-    // flush() explicite pour garantir l'envoi complet avant le recv
-    println!("[{}] Envoi HTTP POST ({} octets)...", seq, request.len());
-    stream.write_all(request.as_bytes())?;
-    stream.flush()?;
-    println!("[{}] {} octets envoyes", seq, request.len());
-
-    // ↔ zsock_recv()
-    let mut rx_buf = [0u8; 512];
-    let n = stream.read(&mut rx_buf)?;
-
-    if n == 0 {
-        eprintln!("[{}] Connexion fermee sans reponse", seq);
-        return Err("no response".into());
-    }
-
-    let response = String::from_utf8_lossy(&rx_buf[..n]);
-
-    // ↔ strstr(rx_buf, "\r\n\r\n")
-    if let Some(pos) = response.find("\r\n\r\n") {
-        println!("[{}] *** ACK SERVEUR : {} ***",
-                 seq, response[pos + 4..].trim());
-    } else {
-        println!("[{}] Reponse brute : {}", seq, response.trim());
-    }
-
-    // ↔ zsock_close() — automatique via drop(stream)
-    println!("[{}] Socket TCP ferme", seq);
-    Ok(())
-}
-
-// ==================================================================
-// main()
-//
-// Équivalent de main() dans main.c Zephyr.
-// Séquence identique :
-//   1. Bannière
-//   2. Connexion Wi-Fi + DHCP
-//   3. Boucle infinie : blink → POST → sleep(3s)
-// ==================================================================
-fn main() {
-    println!("============================================");
-    println!(" WASM HTTP TCP Client + Blinky  [Rust v2]");
-    println!(" SSID    : {}", WIFI_SSID);
-    println!(" Serveur : {}:{}", SERVER_IP, SERVER_PORT);
-    println!("============================================");
-
-    // ↔ int ret = wifi_connect(); if (ret != 0) { LOG_ERR; return ret; }
-    if let Err(e) = wifi_connect_init() {
-        eprintln!("Connexion reseau echouee : {}", e);
-        std::process::exit(1);
-    }
-
-    println!(
-        "Reseau pret — HTTP POST toutes les {}s vers {}:{}",
-        SEND_INTERVAL_SECS, SERVER_IP, SERVER_PORT
-    );
-
-    // ↔ while (1) { seq++; blink_led(); send_http_post(seq); k_sleep(3s); }
     let mut seq: u32 = 0;
     loop {
         seq += 1;
-
-        // ↔ blink_led()
-        blink_led();
-
-        // ↔ ret = send_http_post(seq);
-        if let Err(e) = send_http_post(seq) {
-            // ↔ LOG_WRN("Envoi [%d] echoue, retry dans 3s", seq, ret)
-            eprintln!(
-                "Envoi [{}] echoue ({:?}), retry dans {}s",
-                seq, e, SEND_INTERVAL_SECS
-            );
-        }
-
-        // ↔ k_sleep(K_SECONDS(3))
-        thread::sleep(Duration::from_secs(SEND_INTERVAL_SECS));
+        unsafe { host_gpio_blink(); }
+        send_http_post(seq);
+        unsafe { host_sleep(SEND_INTERVAL); }
     }
+}
+
+// ================================================================
+// STUB x86_64 — pour rust-analyzer et cargo check
+// ================================================================
+#[cfg(not(target_arch = "wasm32"))]
+fn main() {
+    eprintln!("Ce binaire est concu pour wasm32-unknown-unknown.");
+    eprintln!("Compiler avec : bash build_wasm.sh");
 }
