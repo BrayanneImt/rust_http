@@ -16,7 +16,7 @@ import serial
 # ----------------------------------------------------------------
 # Configuration
 # ----------------------------------------------------------------
-PORT      = '/dev/ttyUSB1'
+PORT      = '/dev/ttyUSB0'
 BAUD      = 115200
 WASM_FILE = 'http_rust.wasm'
 
